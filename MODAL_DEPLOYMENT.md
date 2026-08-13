@@ -225,3 +225,5 @@ Landmark extraction dominates; it can be cached to a pickle via
 `--use_saved_coord` / `--saved_coord`, which is worth persisting into the
 volume if the same avatar is reused repeatedly. Containers stay warm for 5
 minutes (`scaledown_window`), so consecutive runs skip startup entirely.
+
+<!-- DUMMY CHANGE: placeholder to exercise the pull request workflow. Remove before merge. -->
