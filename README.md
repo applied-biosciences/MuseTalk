@@ -99,6 +99,37 @@ modal volume put --env main calm-avatar-assets <local-file> source/<name>.mp4
 modal volume get --env main calm-avatar-assets output/<name>.mp4 <local-name>.mp4
 ```
 
+## Sakinah Avatar Integration
+Two "Sakinah" avatars are onboarded in the `calm-avatar-assets` volume for lip-sync rendering:
+
+| Avatar | Source video | Reference image |
+|---|---|---|
+| `sakinah_saudi_female` | `source/sakinah-saudi-female-idle.mp4` | `source/sakinah-saudi-female-master.png` |
+| `sakinah_uk_female` | `source/sakinah-uk-female-idle.mp4` | `source/sakinah-uk-female-master.png` |
+
+A shared reference clip, `source/sakinah-avatar-square-master.png`, and a sample voice line, `audio/sakinah-greeting.wav`, are also provided. Both avatars are pre-registered in `configs/inference/realtime.yaml` for the batch/real-time inference pipeline (`sakinah_saudi_female` and `sakinah_uk_female` entries).
+
+**Important:** MuseTalk is a lip-sync/dubbing model, not a text-to-speech engine. It requires a pre-existing audio file (e.g. `sakinah-greeting.wav`) as input and animates the avatar's lips to match it — it cannot synthesize new speech or clone a voice from text. Generating novel "Sakinah says X" videos requires sourcing or generating the spoken audio separately, then feeding it into this pipeline as `--audio`.
+
+### Generating a sakinah video
+```bash
+modal run --env main test_musetalk_interactive.py \
+    --video sakinah-saudi-female-idle.mp4 \
+    --audio sakinah-greeting.wav \
+    --output sakinah-saudi-female-greeting.mp4
+```
+Replace `sakinah-saudi-female-idle.mp4` with `sakinah-uk-female-idle.mp4` for the UK avatar, and `--audio` with any other clip already present under `audio/` in the volume.
+
+### Verified working
+Both avatars were end-to-end verified against the production deployment using `sakinah-greeting.wav`:
+
+| Avatar | Result | Rendered duration | Resolution |
+|---|---|---|---|
+| `sakinah-saudi-female-idle.mp4` | `status: ok` (104.3s on an NVIDIA L4) | 2.79s | 768x952, H.264/AAC |
+| `sakinah-uk-female-idle.mp4` | `status: ok` (115.8s on an NVIDIA L4) | 2.79s | 768x1022, H.264/AAC |
+
+Both outputs were confirmed byte-valid after download and immediately servable via `GET /video/{name}` on the `stream` endpoint (no redeploy needed, thanks to the volume auto-refresh in `stream`).
+
 # Overview
 `MuseTalk` is a real-time high quality audio-driven lip-syncing model trained in the latent space of `ft-mse-vae`, which
 
