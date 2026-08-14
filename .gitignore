@@ -17,3 +17,8 @@ debug
 exp_out
 .gradio
 .venv/
+
+# Local test artifacts
+*.backup
+/output
+/*.mp4
