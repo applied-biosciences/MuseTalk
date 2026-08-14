@@ -597,10 +597,14 @@ class MuseTalkWorker:
         """
         Runs once whenever Modal starts a new GPU container.
 
-        Verifies CUDA and the MuseTalk repository, then points the
-        repository's expected models directory at the mounted volume.
+        Verifies CUDA and the MuseTalk repository, points the repository's
+        expected models directory at the mounted volume, and warms the
+        model weights so they are loaded once per container instead of
+        once per inference call (see _get_models/_get_face_parser).
         """
         import os
+        import traceback
+
         import torch
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -617,9 +621,32 @@ class MuseTalkWorker:
 
         self._link_models()
 
+        # VAE/FaceParsing/DWPose all resolve their weight paths relative
+        # to the current working directory (e.g. "./models/..."), so
+        # anchor the process here once for the container's lifetime
+        # instead of relying on a per-call subprocess's cwd=REPO_DIR.
+        os.chdir(REPO_DIR)
+
+        self._model_cache = {}
+        self._face_parser_cache = {}
+
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"PyTorch: {torch.__version__}")
+
+        # Warm the default (and overwhelmingly common) combination now,
+        # so even the first inference call on a fresh container skips
+        # model loading rather than paying for it on the hot path. This
+        # also imports musetalk.utils.preprocessing, whose DWPose and
+        # FaceAlignment models load once at module-import time.
+        try:
+            self._get_models(version="v15", use_float16=True)
+            self._get_face_parser(left_cheek_width=90, right_cheek_width=90)
+        except Exception:
+            # Don't fail container startup if warming fails (e.g. weights
+            # not yet downloaded into the volume); inference() will
+            # surface a clear error, or load lazily on the first call.
+            traceback.print_exc()
 
     def _link_models(self):
         """
@@ -643,6 +670,322 @@ class MuseTalkWorker:
 
         os.symlink(MODELS_DIR, REPO_MODELS_LINK)
         print(f"linked {REPO_MODELS_LINK} -> {MODELS_DIR}")
+
+    def _get_models(self, version: str, use_float16: bool) -> dict:
+        """
+        Return the VAE/UNet/Whisper bundle for (version, use_float16),
+        loading and caching it on first use.
+
+        Loading these from disk to GPU is the dominant cost of a cold
+        inference call, so a warm container should never pay it twice
+        for the same combination.
+        """
+        key = (version, use_float16)
+        cached = self._model_cache.get(key)
+        if cached is not None:
+            return cached
+
+        import os
+
+        from transformers import WhisperModel
+
+        from musetalk.utils.audio_processor import AudioProcessor
+        from musetalk.utils.utils import load_all_model
+
+        if version == "v15":
+            unet_model_path = f"{MODELS_DIR}/musetalkV15/unet.pth"
+            unet_config = f"{MODELS_DIR}/musetalkV15/musetalk.json"
+        elif version == "v1":
+            unet_model_path = f"{MODELS_DIR}/musetalk/pytorch_model.bin"
+            unet_config = f"{MODELS_DIR}/musetalk/musetalk.json"
+        else:
+            raise ValueError(f"version must be 'v15' or 'v1', got {version!r}")
+
+        for label, path in (
+            ("unet weights", unet_model_path),
+            ("unet config", unet_config),
+        ):
+            if not os.path.isfile(path):
+                raise RuntimeError(f"{version} {label} missing: {path}")
+
+        device = self.device
+        vae, unet, pe = load_all_model(
+            unet_model_path=unet_model_path,
+            vae_type="sd-vae",
+            unet_config=unet_config,
+            device=device,
+        )
+
+        if use_float16:
+            pe = pe.half()
+            vae.vae = vae.vae.half()
+            unet.model = unet.model.half()
+
+        pe = pe.to(device)
+        vae.vae = vae.vae.to(device)
+        unet.model = unet.model.to(device)
+
+        weight_dtype = unet.model.dtype
+        whisper_dir = f"{MODELS_DIR}/whisper"
+        audio_processor = AudioProcessor(feature_extractor_path=whisper_dir)
+        whisper = WhisperModel.from_pretrained(whisper_dir)
+        whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+        whisper.requires_grad_(False)
+
+        bundle = {
+            "vae": vae,
+            "unet": unet,
+            "pe": pe,
+            "whisper": whisper,
+            "audio_processor": audio_processor,
+            "weight_dtype": weight_dtype,
+        }
+        self._model_cache[key] = bundle
+        print(f"loaded models for version={version} use_float16={use_float16}")
+        return bundle
+
+    def _get_face_parser(self, left_cheek_width: int, right_cheek_width: int):
+        """
+        Return the FaceParsing (BiSeNet) instance for these cheek widths,
+        loading and caching it on first use.
+        """
+        key = (left_cheek_width, right_cheek_width)
+        cached = self._face_parser_cache.get(key)
+        if cached is not None:
+            return cached
+
+        from musetalk.utils.face_parsing import FaceParsing
+
+        face_parser = FaceParsing(
+            left_cheek_width=left_cheek_width,
+            right_cheek_width=right_cheek_width,
+        )
+        self._face_parser_cache[key] = face_parser
+        print(
+            "loaded face parser for "
+            f"left_cheek_width={left_cheek_width} "
+            f"right_cheek_width={right_cheek_width}"
+        )
+        return face_parser
+
+    def _run_inference(
+        self,
+        *,
+        source_video: str,
+        source_audio: str,
+        output_vid_name: str,
+        result_dir: str,
+        version: str,
+        batch_size: int,
+        fps: int,
+        extra_margin: int,
+        parsing_mode: str,
+        bbox_shift: int,
+        models: dict,
+        face_parser,
+    ) -> str:
+        """
+        Run MuseTalk generation in-process using already-loaded models.
+
+        Mirrors the per-task body of upstream scripts/inference.py::main,
+        but takes plain arguments and reuses cached model objects instead
+        of reloading them from disk on every call. scripts/inference.py
+        itself is left untouched and keeps working standalone.
+
+        Returns the absolute path to the produced video.
+        """
+        import copy
+        import glob
+        import os
+        import shutil
+
+        import cv2
+        import numpy as np
+        import torch
+
+        from musetalk.utils.blending import get_image
+        from musetalk.utils.preprocessing import (
+            coord_placeholder,
+            get_landmark_and_bbox,
+        )
+        from musetalk.utils.utils import datagen, get_file_type, get_video_fps
+
+        device = self.device
+        vae = models["vae"]
+        unet = models["unet"]
+        pe = models["pe"]
+        audio_processor = models["audio_processor"]
+        whisper = models["whisper"]
+        weight_dtype = models["weight_dtype"]
+
+        timesteps = torch.tensor([0], device=device)
+
+        input_basename = os.path.splitext(os.path.basename(source_video))[0]
+        audio_basename = os.path.splitext(os.path.basename(source_audio))[0]
+
+        temp_dir = os.path.join(result_dir, version)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        result_img_save_path = os.path.join(
+            temp_dir, f"{input_basename}_{audio_basename}"
+        )
+        crop_coord_save_path = os.path.join(
+            result_dir, "..", input_basename + ".pkl"
+        )
+        os.makedirs(result_img_save_path, exist_ok=True)
+
+        output_path = os.path.join(temp_dir, output_vid_name)
+        save_dir_full = None
+
+        with torch.no_grad():
+            # Extract frames from the avatar video.
+            file_type = get_file_type(source_video)
+            if file_type == "video":
+                save_dir_full = os.path.join(temp_dir, input_basename)
+                os.makedirs(save_dir_full, exist_ok=True)
+                cmd = (
+                    f"ffmpeg -v fatal -i {source_video} "
+                    f"-start_number 0 {save_dir_full}/%08d.png"
+                )
+                os.system(cmd)
+                input_img_list = sorted(
+                    glob.glob(os.path.join(save_dir_full, "*.[jpJP][pnPN]*[gG]"))
+                )
+                video_fps = get_video_fps(source_video)
+            elif file_type == "image":
+                input_img_list = [source_video]
+                video_fps = fps
+            elif os.path.isdir(source_video):
+                input_img_list = glob.glob(
+                    os.path.join(source_video, "*.[jpJP][pnPN]*[gG]")
+                )
+                input_img_list = sorted(
+                    input_img_list,
+                    key=lambda x: int(os.path.splitext(os.path.basename(x))[0]),
+                )
+                video_fps = fps
+            else:
+                raise ValueError(
+                    f"{source_video} should be a video file, an image "
+                    "file or a directory of images"
+                )
+
+            # Extract audio features.
+            whisper_input_features, librosa_length = audio_processor.get_audio_feature(
+                source_audio
+            )
+            whisper_chunks = audio_processor.get_whisper_chunk(
+                whisper_input_features,
+                device,
+                weight_dtype,
+                whisper,
+                librosa_length,
+                fps=video_fps,
+                audio_padding_length_left=2,
+                audio_padding_length_right=2,
+            )
+
+            # Extract landmarks/bboxes and encode avatar frames to latents.
+            print("Extracting landmarks...")
+            coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+
+            input_latent_list = []
+            for bbox, frame in zip(coord_list, frame_list):
+                if bbox == coord_placeholder:
+                    continue
+                x1, y1, x2, y2 = bbox
+                if version == "v15":
+                    y2 = y2 + extra_margin
+                    y2 = min(y2, frame.shape[0])
+                crop_frame = frame[y1:y2, x1:x2]
+                crop_frame = cv2.resize(
+                    crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4
+                )
+                latents = vae.get_latents_for_unet(crop_frame)
+                input_latent_list.append(latents)
+
+            frame_list_cycle = frame_list + frame_list[::-1]
+            coord_list_cycle = coord_list + coord_list[::-1]
+            input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+
+            # Batch inference.
+            print("Starting inference")
+            gen = datagen(
+                whisper_chunks=whisper_chunks,
+                vae_encode_latents=input_latent_list_cycle,
+                batch_size=batch_size,
+                delay_frame=0,
+                device=device,
+            )
+
+            res_frame_list = []
+            for whisper_batch, latent_batch in gen:
+                audio_feature_batch = pe(whisper_batch)
+                latent_batch = latent_batch.to(dtype=unet.model.dtype)
+
+                pred_latents = unet.model(
+                    latent_batch, timesteps, encoder_hidden_states=audio_feature_batch
+                ).sample
+                recon = vae.decode_latents(pred_latents)
+                for res_frame in recon:
+                    res_frame_list.append(res_frame)
+
+            # Blend generated faces back into the original frames.
+            print("Padding generated images to original video size")
+            for i, res_frame in enumerate(res_frame_list):
+                bbox = coord_list_cycle[i % len(coord_list_cycle)]
+                ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
+                x1, y1, x2, y2 = bbox
+                if version == "v15":
+                    y2 = y2 + extra_margin
+                    y2 = min(y2, ori_frame.shape[0])
+                try:
+                    res_frame = cv2.resize(
+                        res_frame.astype(np.uint8), (x2 - x1, y2 - y1)
+                    )
+                except Exception:
+                    continue
+
+                if version == "v15":
+                    combine_frame = get_image(
+                        ori_frame,
+                        res_frame,
+                        [x1, y1, x2, y2],
+                        mode=parsing_mode,
+                        fp=face_parser,
+                    )
+                else:
+                    combine_frame = get_image(
+                        ori_frame, res_frame, [x1, y1, x2, y2], fp=face_parser
+                    )
+                cv2.imwrite(
+                    f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame
+                )
+
+        # Mux frames + audio into the final video.
+        temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
+        cmd_img2video = (
+            f"ffmpeg -y -v warning -r {video_fps} -f image2 "
+            f"-i {result_img_save_path}/%08d.png "
+            f"-vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
+        )
+        os.system(cmd_img2video)
+
+        cmd_combine_audio = (
+            f"ffmpeg -y -v warning -i {source_audio} "
+            f"-i {temp_vid_path} {output_path}"
+        )
+        os.system(cmd_combine_audio)
+
+        shutil.rmtree(result_img_save_path, ignore_errors=True)
+        if os.path.isfile(temp_vid_path):
+            os.remove(temp_vid_path)
+        if save_dir_full and os.path.isdir(save_dir_full):
+            shutil.rmtree(save_dir_full, ignore_errors=True)
+        if os.path.isfile(crop_coord_save_path):
+            os.remove(crop_coord_save_path)
+
+        return output_path
 
     @modal.method()
     def inference(
@@ -672,7 +1015,6 @@ class MuseTalkWorker:
         """
         import os
         import shutil
-        import subprocess
         import time
         import traceback
         import uuid
@@ -708,23 +1050,10 @@ class MuseTalkWorker:
                     f"{missing}. Run `modal run modal_musetalk.py::download`."
                 )
 
-            if version == "v15":
-                unet_model_path = f"{MODELS_DIR}/musetalkV15/unet.pth"
-                unet_config = f"{MODELS_DIR}/musetalkV15/musetalk.json"
-            elif version == "v1":
-                unet_model_path = f"{MODELS_DIR}/musetalk/pytorch_model.bin"
-                unet_config = f"{MODELS_DIR}/musetalk/musetalk.json"
-            else:
+            if version not in ("v15", "v1"):
                 raise ValueError(
                     f"version must be 'v15' or 'v1', got {version!r}"
                 )
-
-            for label, path in (
-                ("unet weights", unet_model_path),
-                ("unet config", unet_config),
-            ):
-                if not os.path.isfile(path):
-                    raise RuntimeError(f"{version} {label} missing: {path}")
 
             self._link_models()
 
@@ -743,70 +1072,35 @@ class MuseTalkWorker:
                 stem = stem[: -len(".mp4")]
             output_vid_name = f"{stem}.mp4"
 
-            # Upstream only accepts tasks through a YAML config file.
-            config_path = os.path.join(work_dir, "task.yaml")
-            with open(config_path, "w") as handle:
-                handle.write(
-                    "task_0:\n"
-                    f'  video_path: "{source_video}"\n'
-                    f'  audio_path: "{source_audio}"\n'
-                    f"  bbox_shift: {bbox_shift}\n"
-                )
-
-            command = [
-                "python",
-                "-m",
-                "scripts.inference",
-                "--inference_config", config_path,
-                "--result_dir", result_dir,
-                "--unet_model_path", unet_model_path,
-                "--unet_config", unet_config,
-                "--whisper_dir", f"{MODELS_DIR}/whisper",
-                "--version", version,
-                "--output_vid_name", output_vid_name,
-                "--batch_size", str(batch_size),
-                "--fps", str(fps),
-                "--extra_margin", str(extra_margin),
-                "--parsing_mode", parsing_mode,
-                "--left_cheek_width", str(left_cheek_width),
-                "--right_cheek_width", str(right_cheek_width),
-                "--bbox_shift", str(bbox_shift),
-                "--ffmpeg_path", "/usr/bin",
-            ]
-            if use_float16:
-                command.append("--use_float16")
-
-            print("running:", " ".join(command))
-
-            completed = subprocess.run(
-                command,
-                cwd=REPO_DIR,
-                capture_output=True,
-                text=True,
+            # Reuses cached models loaded once per container (see
+            # start_container/_get_models/_get_face_parser) instead of
+            # spawning a fresh `python -m scripts.inference` subprocess
+            # that would reload every weight from disk on every call.
+            model_bundle = self._get_models(
+                version=version, use_float16=use_float16
+            )
+            face_parser = self._get_face_parser(
+                left_cheek_width=left_cheek_width,
+                right_cheek_width=right_cheek_width,
             )
 
-            # Stream the child output into this container's logs so the
-            # Modal dashboard shows progress and tracebacks.
-            if completed.stdout:
-                print(completed.stdout)
-            if completed.stderr:
-                print(completed.stderr)
-
-            # scripts.inference catches per-task exceptions, prints them and
-            # still exits 0, so a zero return code does not mean success.
-            # The produced file is the only trustworthy signal.
-            produced = os.path.join(result_dir, version, output_vid_name)
+            produced = self._run_inference(
+                source_video=source_video,
+                source_audio=source_audio,
+                output_vid_name=output_vid_name,
+                result_dir=result_dir,
+                version=version,
+                batch_size=batch_size,
+                fps=fps,
+                extra_margin=extra_margin,
+                parsing_mode=parsing_mode,
+                bbox_shift=bbox_shift,
+                models=model_bundle,
+                face_parser=face_parser,
+            )
 
             if not os.path.isfile(produced):
-                tail = "\n".join(
-                    (completed.stdout or "").splitlines()[-15:]
-                    + (completed.stderr or "").splitlines()[-15:]
-                )
-                raise RuntimeError(
-                    "Inference produced no output video "
-                    f"(exit code {completed.returncode}). Last log lines:\n"
-                    f"{tail}"
-                )
+                raise RuntimeError("Inference produced no output video")
 
             output_rel_path = os.path.join(OUTPUT_SUBDIR, output_vid_name)
             destination = os.path.join(AVATARS_DIR, output_rel_path)
