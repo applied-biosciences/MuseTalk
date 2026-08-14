@@ -1,10 +1,11 @@
-avator_1:
- preparation: True # your can set it to False if you want to use the existing avator, it will save time
- bbox_shift: 5
- video_path: "data/video/yongen.mp4"
- audio_clips:
-     audio_0: "data/audio/yongen.wav"
-     audio_1: "data/audio/eng.wav"
- 
-  
+sakinah_saudi_female:
+  preparation: true
+  video_path: /avatars/source/sakinah-saudi-female-idle.mp4
+  audio_clips:
+    test: /avatars/audio/test-arabic.wav
 
+sakinah_uk_female:
+  preparation: true
+  video_path: /avatars/source/sakinah-uk-female-idle.mp4
+  audio_clips:
+    test: /avatars/audio/test-english.wav

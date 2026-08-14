@@ -26,6 +26,79 @@ This version **(1)** integrates training with perceptual loss, GAN loss, and syn
 Learn more details [here](https://arxiv.org/abs/2410.10122).
 **The inference codes, training codes and model weights of MuseTalk 1.5 are all available now!** 🚀
 
+# Modal Deployment (calm-musetalk)
+This fork adds a hosted deployment of MuseTalk on [Modal](https://modal.com), defined in `modal_musetalk.py`. It runs inference on an on-demand NVIDIA L4 GPU and serves rendered videos over HTTP.
+
+## Architecture
+- **App**: `calm-musetalk`, deployed to the `main` Modal environment.
+- **Volumes**:
+  - `calm-musetalk-models` (mounted at `/models`): MuseTalk model weights (~8 GB).
+  - `calm-avatar-assets` (mounted at `/avatars`): avatar assets, with `source/` (input videos), `audio/` (input audio), and `output/` (rendered results) subdirectories.
+- **GPU worker**: the `MuseTalkWorker` class runs inference on an NVIDIA L4 GPU, scaling to zero when idle.
+
+## API Endpoints
+Once deployed, the following HTTPS endpoints are available under `https://<workspace>--calm-musetalk-<function>.modal.run`:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` (`health` function) | GET | Health check. Returns `{"status": "healthy", "app": "calm-musetalk", "message": "MuseTalk service is deployed"}`. |
+| `/` (`stream` function) | GET | Index of the streaming API's routes. |
+| `/videos` (`stream` function) | GET | Lists renderable videos in `output/`, each with `name`, `size_mb`, and `url`. |
+| `/video/{name}` (`stream` function) | GET, HEAD | Streams a rendered video with HTTP byte-range support (206 partial content, seek/scrub, Safari-compatible). Only files under `output/` are servable; anything else (including path traversal) returns 404. |
+| `/player/{name}` (`stream` function) | GET | Minimal HTML page with a `<video>` tag pointed at `/video/{name}`. |
+| `/` (`test_saudi_female` function) | GET | Returns the raw `source/saudi-female.mp4` file for quick manual testing (404 if missing). |
+
+Two more pieces of functionality are only reachable via the Modal CLI/SDK, not HTTP:
+- `download_models`: populates `calm-musetalk-models` with every required weight. Idempotent — skips files already present unless `force=True`.
+- `MuseTalkWorker.inference(...)` / `MuseTalkWorker.status()`: runs lip-sync inference (writing results to `output/` in `calm-avatar-assets`) and reports GPU/CUDA/PyTorch diagnostics, respectively.
+
+## Deployment
+### Prerequisites
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt modal
+modal setup   # authenticate the Modal CLI, one-time
+```
+
+### Deploy to production
+```bash
+modal deploy --env main modal_musetalk.py
+```
+This creates or updates the persistent `calm-musetalk` app and prints the live URLs for `health`, `stream`, and `test_saudi_female`.
+
+### Download model weights (one-time, ~8 GB)
+```bash
+modal run --env main modal_musetalk.py::download
+```
+
+### Run inference from the CLI
+```bash
+modal run --env main modal_musetalk.py::generate \
+    --video-path source/<video>.mp4 \
+    --audio-path audio/<audio>.wav
+```
+
+### Interactive test script
+`test_musetalk_interactive.py` submits a job to `MuseTalkWorker` using CLI arguments (no interactive prompts):
+```bash
+modal run --env main test_musetalk_interactive.py \
+    --video <source-filename-or-path> \
+    --audio <audio-filename-or-path> \
+    --output <output-filename>.mp4
+```
+`--yes` defaults to `True`, so the job submits immediately; pass `--no-yes` to only print the resolved job details without running inference.
+
+### Managing avatar assets
+Source videos, audio clips, and rendered output live in the `calm-avatar-assets` volume under `source/`, `audio/`, and `output/` respectively:
+```bash
+modal volume ls --env main calm-avatar-assets source
+modal volume ls --env main calm-avatar-assets audio
+modal volume ls --env main calm-avatar-assets output
+modal volume put --env main calm-avatar-assets <local-file> source/<name>.mp4
+modal volume get --env main calm-avatar-assets output/<name>.mp4 <local-name>.mp4
+```
+
 # Overview
 `MuseTalk` is a real-time high quality audio-driven lip-syncing model trained in the latent space of `ft-mse-vae`, which
 
