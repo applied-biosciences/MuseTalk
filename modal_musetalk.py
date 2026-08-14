@@ -320,6 +320,232 @@ def health():
 
 
 # -------------------------------------------------------------------
+# CPU streaming endpoint
+# -------------------------------------------------------------------
+
+# Rendered videos are served straight off the assets volume by a small
+# CPU container, so a webpage can point a <video> tag at Modal instead
+# of downloading the file first.
+STREAM_DIR = "/avatars"
+
+# Only files under these subdirectories of the volume are servable, so
+# source footage and input audio stay private.
+OUTPUT_SUBDIR = "output"
+STREAMABLE_SUBDIRS = (OUTPUT_SUBDIR,)
+
+# 1 MiB keeps memory flat while still being large enough that a typical
+# player fetches a whole clip in a handful of reads.
+STREAM_CHUNK_SIZE = 1024 * 1024
+
+MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+}
+
+
+@app.function(
+    image=api_image,
+    # Mounted read-write rather than read-only so that reload() below can
+    # refresh the mount; nothing in this function writes to the volume.
+    volumes={STREAM_DIR: avatars},
+    scaledown_window=300,
+)
+@modal.concurrent(max_inputs=20)
+@modal.asgi_app()
+def stream():
+    """
+    Serve rendered videos over HTTP with byte-range support.
+
+    Range support is what makes the files usable from a webpage: without
+    it seeking is impossible and Safari refuses to play the video at all.
+    """
+    import os
+    import re
+
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import HTMLResponse, Response, StreamingResponse
+
+    web = FastAPI(title=f"{APP_NAME} media")
+
+    # Lets a <video> tag on any origin play these files. Narrow
+    # allow_origins to your own domain to stop other sites embedding them.
+    web.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "HEAD", "OPTIONS"],
+        allow_headers=["Range"],
+        expose_headers=[
+            "Accept-Ranges",
+            "Content-Length",
+            "Content-Range",
+        ],
+    )
+
+    def refresh_volume():
+        """
+        A container sees the volume as it was when the container started,
+        so videos rendered since then are invisible until we reload.
+        """
+        try:
+            avatars.reload()
+        except Exception as exc:
+            # A stale listing is preferable to failing the request.
+            print(f"volume reload failed: {type(exc).__name__}: {exc}")
+
+    def resolve(rel_path: str) -> str:
+        """
+        Turn a request path into a file on the volume, rejecting anything
+        that escapes the whitelisted subdirectories (e.g. "../source/x").
+        """
+        candidate = os.path.normpath(
+            os.path.join(STREAM_DIR, rel_path.lstrip("/"))
+        )
+
+        roots = [os.path.join(STREAM_DIR, d) for d in STREAMABLE_SUBDIRS]
+        if not any(candidate.startswith(root + os.sep) for root in roots):
+            raise HTTPException(status_code=404, detail="not found")
+
+        if not os.path.isfile(candidate):
+            raise HTTPException(status_code=404, detail="not found")
+
+        return candidate
+
+    def serve(path: str, request: Request) -> Response:
+        size = os.path.getsize(path)
+        extension = os.path.splitext(path)[1].lower()
+
+        start = 0
+        end = size - 1
+        status_code = 200
+        headers = {
+            "accept-ranges": "bytes",
+            "cache-control": "public, max-age=3600",
+        }
+        media_type = MEDIA_TYPES.get(extension, "application/octet-stream")
+
+        # Only "bytes=<first>-[<last>]" is honoured. Suffix ranges and
+        # multi-range requests fall through to a normal 200, which is a
+        # legal response and one every player handles.
+        range_header = request.headers.get("range", "")
+        match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header.strip())
+
+        if match:
+            start = int(match.group(1))
+            if match.group(2):
+                end = min(int(match.group(2)), size - 1)
+
+            if start > end or start >= size:
+                return Response(
+                    status_code=416,
+                    headers={
+                        "content-range": f"bytes */{size}",
+                        "accept-ranges": "bytes",
+                    },
+                )
+
+            status_code = 206
+            headers["content-range"] = f"bytes {start}-{end}/{size}"
+
+        length = end - start + 1
+        headers["content-length"] = str(length)
+
+        # Players probe with HEAD before streaming; answering with the
+        # headers alone avoids reading the file for nothing.
+        if request.method == "HEAD":
+            return Response(
+                status_code=status_code,
+                headers=headers,
+                media_type=media_type,
+            )
+
+        def chunks():
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            chunks(),
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+
+    @web.get("/")
+    def index():
+        return {
+            "app": APP_NAME,
+            "videos": "/videos",
+            "stream": "/video/{name}",
+            "player": "/player/{name}",
+        }
+
+    @web.get("/videos")
+    def list_videos():
+        refresh_volume()
+
+        root = os.path.join(STREAM_DIR, OUTPUT_SUBDIR)
+        if not os.path.isdir(root):
+            return {"videos": []}
+
+        videos = []
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            extension = os.path.splitext(name)[1].lower()
+
+            if os.path.isfile(path) and extension in MEDIA_TYPES:
+                videos.append(
+                    {
+                        "name": name,
+                        "size_mb": round(os.path.getsize(path) / 1e6, 2),
+                        "url": f"/video/{name}",
+                    }
+                )
+
+        return {"videos": videos}
+
+    @web.api_route("/video/{name:path}", methods=["GET", "HEAD"])
+    def video(name: str, request: Request):
+        refresh_volume()
+        return serve(resolve(os.path.join(OUTPUT_SUBDIR, name)), request)
+
+    @web.get("/player/{name:path}", response_class=HTMLResponse)
+    def player(name: str):
+        # Confirms the file exists before handing back a page that would
+        # otherwise render an empty player.
+        refresh_volume()
+        resolve(os.path.join(OUTPUT_SUBDIR, name))
+
+        return f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>{name}</title>
+    <style>
+      body {{ margin: 0; background: #111; display: grid;
+              place-items: center; min-height: 100vh; }}
+      video {{ max-width: 90vw; max-height: 90vh; }}
+    </style>
+  </head>
+  <body>
+    <video src="/video/{name}" controls autoplay playsinline></video>
+  </body>
+</html>
+"""
+
+    return web
+
+
+# -------------------------------------------------------------------
 # L4 GPU worker
 # -------------------------------------------------------------------
 REPO_DIR = "/opt/MuseTalk"
@@ -710,3 +936,33 @@ def test_gpu():
 
     print("GPU worker result:")
     print(result)
+
+
+
+@app.function(
+    image=api_image,
+    volumes={"/avatars": avatars},
+)
+@modal.fastapi_endpoint(method="GET")
+def test_saudi_female():
+    from pathlib import Path
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    video = Path("/avatars/source/saudi-female.mp4")
+
+    if not video.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Video does not exist: {video}",
+        )
+
+    return FileResponse(
+        path=str(video),
+        media_type="video/mp4",
+        headers={
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        },
+    )
