@@ -799,7 +799,6 @@ class MuseTalkWorker:
         import os
         import shutil
         import subprocess
-        import time
 
         import cv2
         import numpy as np
@@ -911,13 +910,6 @@ class MuseTalkWorker:
             input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
 
             # Batch inference.
-            musetalk_started = time.time()
-            print(
-                f"[diag] MuseTalk inference starting: "
-                f"input_basename={input_basename} audio_basename={audio_basename} "
-                f"num_frames={len(frame_list_cycle)} batch_size={batch_size} "
-                f"at {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
             print("Starting inference")
             gen = datagen(
                 whisper_chunks=whisper_chunks,
@@ -938,13 +930,6 @@ class MuseTalkWorker:
                 recon = vae.decode_latents(pred_latents)
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
-
-            print(
-                f"[diag] MuseTalk inference finished: "
-                f"generated {len(res_frame_list)} frames in "
-                f"{time.time() - musetalk_started:.2f}s at "
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
 
             # Blend generated faces back into the original frames.
             print("Padding generated images to original video size")
@@ -987,48 +972,21 @@ class MuseTalkWorker:
         )
         os.system(cmd_img2video)
 
-        silent_video_exists = os.path.isfile(temp_vid_path)
-        silent_video_size = (
-            os.path.getsize(temp_vid_path) if silent_video_exists else 0
-        )
-        print(
-            f"[diag] silent video path={temp_vid_path} "
-            f"exists={silent_video_exists} size_bytes={silent_video_size}"
-        )
-
-        audio_exists = os.path.isfile(source_audio)
-        audio_size = os.path.getsize(source_audio) if audio_exists else 0
-        print(
-            f"[diag] input audio path={source_audio} "
-            f"exists={audio_exists} size_bytes={audio_size}"
-        )
-
         cmd_combine_audio = (
             f"ffmpeg -y -v warning -i {source_audio} "
             f"-i {temp_vid_path} {output_path}"
         )
-        print(f"[diag] FFmpeg command: {cmd_combine_audio}")
-        ffmpeg_started = time.time()
-        print(f"[diag] FFmpeg starting at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         ffmpeg_result = subprocess.run(
             cmd_combine_audio,
             shell=True,
             capture_output=True,
             text=True,
         )
-        print(
-            f"[diag] FFmpeg finished: returncode={ffmpeg_result.returncode} "
-            f"in {time.time() - ffmpeg_started:.2f}s"
-        )
         if ffmpeg_result.returncode != 0:
-            print(f"[diag] FFmpeg stderr:\n{ffmpeg_result.stderr}")
-
-        final_mp4_exists = os.path.isfile(output_path)
-        final_mp4_size = os.path.getsize(output_path) if final_mp4_exists else 0
-        print(
-            f"[diag] final mp4 path={output_path} "
-            f"exists={final_mp4_exists} size_bytes={final_mp4_size}"
-        )
+            raise RuntimeError(
+                f"ffmpeg audio/video mux failed (returncode="
+                f"{ffmpeg_result.returncode}): {ffmpeg_result.stderr}"
+            )
 
         shutil.rmtree(result_img_save_path, ignore_errors=True)
         if os.path.isfile(temp_vid_path):
@@ -1162,13 +1120,9 @@ class MuseTalkWorker:
             avatars.commit()
 
             size_bytes = os.path.getsize(destination)
-            print(
-                f"[diag] final mp4 copied to volume: path={destination} "
-                f"exists={os.path.isfile(destination)} size_bytes={size_bytes}"
-            )
             shutil.rmtree(work_dir, ignore_errors=True)
 
-            result = {
+            return {
                 "status": "ok",
                 "app": APP_NAME,
                 "version": version,
@@ -1179,8 +1133,6 @@ class MuseTalkWorker:
                 "output_size_mb": round(size_bytes / 1e6, 2),
                 "duration_seconds": round(time.time() - started, 1),
             }
-            print(f"[diag] returning result to calm-musetalk-bridge: {result}")
-            return result
         except Exception as exc:
             # Return a plain-string error rather than letting an exception
             # that may reference torch objects escape to a local client
