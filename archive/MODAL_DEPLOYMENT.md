@@ -19,7 +19,7 @@ a GPU:
 | --- | --- | --- |
 | `health` | CPU | Public `GET` endpoint reporting that the app is deployed |
 | `download_models` | CPU (4 cores) | Populates the model volume with ~8.5 GB of weights |
-| `MuseTalkWorker` | L4 GPU | Runs inference; scales to zero after 5 minutes idle |
+| `MuseTalkWorker` | L40S preferred, L4 fallback | Runs MuseTalk inference; scales to zero after 5 minutes idle |
 
 Two Modal volumes hold all persistent state, so container images stay lean and
 weights survive redeploys:
@@ -172,7 +172,7 @@ recommendations:
 | `extra_margin` | `10` | Extra chin margin, v1.5 only |
 | `parsing_mode` | `jaw` | Face blending mode |
 | `left/right_cheek_width` | `90` | Cheek blending region |
-| `use_float16` | `True` | fp16 inference, well suited to the L4 |
+| `use_float16` | `True` | fp16 inference, well suited to both the L40S and the L4 |
 | `bbox_shift` | `0` | **Ignored by v1.5**; affects v1 only |
 
 ## Implementation notes
@@ -220,7 +220,10 @@ diffusion_pytorch_model.safetensors found in directory models/sd-vae.
 
 ## Performance
 
-A cold run on an L4 takes roughly 2.5 minutes end to end for a ~3 second clip.
+The worker requests an L40S first and falls back to an L4 when Modal cannot
+allocate one; `test_gpu` reports which GPU was actually assigned. A cold run
+on an L4 takes roughly 2.5 minutes end to end for a ~3 second clip; the L40S
+is faster.
 Landmark extraction dominates; it can be cached to a pickle via
 `--use_saved_coord` / `--saved_coord`, which is worth persisting into the
 volume if the same avatar is reused repeatedly. Containers stay warm for 5

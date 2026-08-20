@@ -91,7 +91,7 @@ musetalk_image = (
 MODELS_DIR = "/models"
 
 # Downloading is pure network/disk work, so it runs on cheap CPU
-# containers rather than on the L4 worker.
+# containers rather than on the GPU worker.
 download_image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -546,7 +546,7 @@ def stream():
 
 
 # -------------------------------------------------------------------
-# L4 GPU worker
+# GPU worker (L40S preferred, L4 fallback)
 # -------------------------------------------------------------------
 REPO_DIR = "/opt/MuseTalk"
 AVATARS_DIR = "/avatars"
@@ -582,7 +582,7 @@ REQUIRED_FOR_INFERENCE = [
 
 @app.cls(
     image=musetalk_image,
-    gpu="L4",
+    gpu=["L40S", "L4"],
     volumes={
         "/models": models,
         "/avatars": avatars,
@@ -1235,7 +1235,7 @@ def generate(
 
 @app.local_entrypoint()
 def test_gpu():
-    print("Starting MuseTalk L4 worker...")
+    print("Starting MuseTalk worker with L40S preferred and L4 fallback...")
 
     result = MuseTalkWorker().status.remote()
 
